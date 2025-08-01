@@ -16,7 +16,7 @@ np.random.seed(2266)
 # 数据集存储地址
 datasetroot_dir = "/root/cifar100"
 # 生成数据集存储地址
-basedir = "./cifar100-incremental-{}-task-{}".format(alpha, num_task)
+basedir = "./cifar100-dir-{}-task-{}".format(alpha, num_task)
 if not os.path.exists(basedir):
     os.mkdir(basedir)
 
