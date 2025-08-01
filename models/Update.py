@@ -32,7 +32,135 @@ class DatasetSplit(Dataset):
         image, label = self.dataset[self.idxs[item]]
         return image, label
 
+    import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class AnchorContrastiveLoss(nn.Module):
+    def __init__(self, anchors, temperature=0.1, device='cuda'):
+        """
+        初始化函数
+        :param anchors: 预定义的锚点张量 [num_classes, feature_dim]
+        :param temperature: 温度系数，用于缩放logits
+        :param device: 计算设备 ('cuda' or 'cpu')
+        """
+        super(AnchorContrastiveLoss, self).__init__()
+        # 将anchors注册为非训练参数
+        self.anchors = nn.Parameter(anchors, requires_grad=False)
+        self.temperature = temperature
+        self.device = device
+
+        # 用于在训练过程中记录一些度量指标
+        self.metrics = {
+            'hard_neg_sim': 0.0,
+            'dynamic_k': 0
+        }
+
+    def forward(self, features, labels):
+        """
+        前向传播函数
+        :param features: 输入的特征张量 [Batch_size, feature_dim]
+        :param labels: 对应的标签 [Batch_size]
+        :return: 计算出的损失值
+        """
+        # 如果输入特征的维度与锚点维度不匹配，则动态调整锚点维度
+        if features.size(1) != self.anchors.size(1):
+            self._adjust_anchor_dim(features.size(1))
+
+        # 计算特征与所有锚点的余弦相似度
+        anchor_sim = F.cosine_similarity(
+            features.unsqueeze(1),  # 形状变为 [B, 1, D]
+            self.anchors.unsqueeze(0),  # 形状变为 [1, K, D]
+            dim=2
+        )  # 输出形状为 [B, K]
+
+        # 调用动态困难负样本挖掘的损失函数
+        return self.dynamic_hard_neg_loss(anchor_sim, labels)
+
+    def dynamic_hard_neg_loss(self, anchor_similarity, labels, 
+                             k=5, alpha=0.8, adaptive_k=True):
+        """
+        带有动态困难负样本挖掘的对比损失函数
+        :param anchor_similarity: 特征与锚点的余弦相似度 [B, K]
+        :param labels: 真实标签 [B]
+        :param k: 基础的负样本挖掘数量
+        :param alpha: 混合权重，用于平衡困难负样本和所有样本
+        :param adaptive_k: 是否启用自适应k值
+        :return: 损失值
+        """
+        logits = anchor_similarity / self.temperature
+        batch_size, num_anchors = logits.shape
+
+        # 创建正样本的掩码
+        pos_mask = F.one_hot(labels, num_classes=num_anchors).bool()
+
+        # 将正样本位置的logits填充为负无穷，以便后续只关注负样本
+        neg_logits = logits.masked_fill(pos_mask, -float('inf'))
+
+        if adaptive_k:
+            with torch.no_grad():
+                # --- START: 修改部分 ---
+                # 步骤 1: 将余弦相似度从[-1, 1]归一化到[0, 1]
+                # (S_b,c + 1) / 2
+                normalized_sim = (anchor_similarity.detach() + 1) / 2
+                
+                # 步骤 2: 计算归一化后的平均相似度 s_avg
+                # savg = (1 / (B * C)) * sum( (S_b,c + 1) / 2 )
+                s_avg = torch.mean(normalized_sim)
+                
+                # 步骤 3: 根据 s_avg 计算动态的 k 值
+                # k_dynamic = min(k_base + floor(10 * s_avg), C - 1)
+                # 使用 int() 来实现 floor 功能
+                dynamic_k = min(k + int(s_avg * 10), num_anchors - 1)
+                # --- END: 修改部分 ---
+        else:
+            dynamic_k = k
+        
+        # 从负样本中选取topk个最困难的（即相似度最高的）
+        hard_neg, _ = torch.topk(neg_logits, k=dynamic_k, dim=1)
+        
+        # 获取正样本的分数
+        pos_scores = logits.gather(1, labels.view(-1, 1))
+
+        # 计算包含所有样本的log_sum_exp
+        log_sum_all = torch.logsumexp(logits, dim=1, keepdim=True)
+
+        # 将正样本分数和困难负样本分数合并，用于计算困难样本的log_sum_exp
+        combined = torch.cat([pos_scores, hard_neg], dim=1)
+        log_sum_hard = torch.logsumexp(combined, dim=1, keepdim=True)
+
+        # 动态调整alpha值，使得模型在不同阶段更关注困难样本
+        if self.training and adaptive_k:
+            with torch.no_grad():
+                hard_sim = torch.mean(hard_neg)
+                adapt_alpha = torch.sigmoid(hard_sim * 5)
+                alpha = alpha * 0.9 + adapt_alpha * 0.1
+        
+        # 计算最终的损失函数
+        # 结合了 InfoNCE loss 和 hard negative mining 的思想
+        loss = - (pos_scores - (alpha * log_sum_hard + (1 - alpha) * log_sum_all)).mean()
+        
+        # 如果在训练模式，则记录相关指标
+        if self.training:
+            self.metrics['hard_neg_sim'] = hard_neg.mean().item()
+            self.metrics['dynamic_k'] = dynamic_k
+            
+        return loss
+
+    def _adjust_anchor_dim(self, target_dim):
+        """
+        当输入特征维度变化时，动态调整锚点的维度。
+        这在模型结构变化或迁移学习场景中可能有用。
+        """
+        current_dim = self.anchors.size(1)
+        #print(f"Adjusting anchor dimensions from {current_dim} to {target_dim}.")
+        # 使用一个简单的线性层来做维度映射
+        linear = nn.Linear(current_dim, target_dim).to(self.device)
+        # 更新锚点参数（不参与梯度计算）
+        self.anchors = nn.Parameter(linear(self.anchors.detach()), requires_grad=False)
+        return self.anchors
+
+'''class AnchorContrastiveLoss(nn.Module):
     def __init__(self, anchors, temperature=0.1, device='cuda'):
 
         super(AnchorContrastiveLoss, self).__init__()
@@ -59,7 +187,7 @@ class AnchorContrastiveLoss(nn.Module):
         return self.dynamic_hard_neg_loss(anchor_sim, labels)
 
     def dynamic_hard_neg_loss(self, anchor_similarity, labels, 
-                             k=10, alpha=0.8, adaptive_k=True):
+                             k=5, alpha=0.8, adaptive_k=True):
         logits = anchor_similarity / self.temperature
         batch_size, num_anchors = logits.shape
 
@@ -101,9 +229,10 @@ class AnchorContrastiveLoss(nn.Module):
         """动态调整锚点维度"""
         linear = nn.Linear(self.anchors.size(1), target_dim).to(self.device)
         self.anchors = nn.Parameter(linear(self.anchors), requires_grad=False)
-        return self.anchors
+        return self.anchors'''
 
-class LocalUpdateFedACD(object):
+
+'''class LocalUpdateFedACD(object):
     def __init__(self, args, anchor=None, dataset=None, idxs=None, task=0, pretrain=False):
         self.args = args
         self.loss_func = nn.CrossEntropyLoss()
@@ -258,9 +387,176 @@ class LocalUpdateFedACD(object):
             for lbl in agg_protos_label:
                 agg_protos_label[lbl] /= len(agg_protos_label[lbl])
 
+        return net.state_dict(), sum(epoch_loss)/len(epoch_loss), agg_protos_label'''
+
+class LocalUpdateFedACD(object):
+    def __init__(self, args, anchor=None, dataset=None, idxs=None, task=0, pretrain=False):
+        self.args = args
+        self.loss_func = nn.CrossEntropyLoss()
+        self.selected_clients = []
+        self.ldr_train = load_train_data(dataset, idxs, task, batch_size=self.args.local_bs)
+        self.pretrain = pretrain
+        self.anchor = anchor.to(self.args.device) if anchor is not None else torch.randn(args.num_classes, 100).to(args.device)
+        self.num_classes = args.num_classes
+
+        # 初始化元学习率为可训练参数，并使用Adam优化器
+        self.base_meta = nn.Parameter(torch.tensor(args.meta_lr))  # 初始元学习率来自args
+        self.meta_optimizer = torch.optim.Adam([self.base_meta], lr=0.001)  # 配置Adam优化器
+        self.min_lr = getattr(args, 'min_meta_lr', 0.8)    # 最小元学习率
+        self.max_lr = getattr(args, 'max_meta_lr', 1.0)    # 最大元学习率
+
+    def train(self, net, teacher_net, lr, idx=-1, local_eps=None):
+        net.train()
+        teacher_net.eval()
+        # num_classes, feat_dim = self.anchor.size() # 这行可以保留，也可以删除，因为后面没用到 feat_dim
+
+        # --- 删除开始 ---
+        # 这部分代码是问题的根源，它创建了一个将教师模型输出固定映射到100维的层
+        # if self.args.dataset == 'fmnist':
+        #     input_tensor = torch.randn(1, 1, 28, 28).to(self.args.device)
+        # elif self.args.dataset == 'tinyimagenet':
+        #     input_tensor = torch.randn(1, 3, 64, 64).to(self.args.device)
+        # else:
+        #     input_tensor = torch.randn(1, 3, 32, 32).to(self.args.device)
+        # with torch.no_grad():
+        #     teacher_output_size = teacher_net(input_tensor).size(1)
+        # self.teacher_output_adjuster = nn.Linear(teacher_output_size, 100).to(self.args.device)
+        # --- 删除结束 ---
+
+        initial_body_state = {name: param.clone().detach() for name, param in net.named_parameters() if 'linear' not in name}
+
+        # 仅训练body部分
+        body_params = [p for name, p in net.named_parameters() if 'linear' not in name]
+        head_params = [p for name, p in net.named_parameters() if 'linear' in name]
+        for para in head_params:
+            para.requires_grad = False
+        optimizer = torch.optim.SGD(body_params, lr=lr, momentum=self.args.momentum, weight_decay=self.args.wd)
+        epoch_loss = []
+        local_eps = self.args.local_ep_pretrain if self.pretrain else self.args.local_ep if local_eps is None else local_eps
+
+        # GradNorm相关参数
+        loss_weights = torch.ones(3, requires_grad=True, device=self.args.device)
+        optimizer_weights = torch.optim.Adam([loss_weights], lr=0.01)
+
+        for iter in range(local_eps):
+            batch_loss = []
+            for batch_idx, (images, labels) in enumerate(self.ldr_train):
+                images, labels = images.to(self.args.device), labels.to(self.args.device)
+                features = net.extract_features(images)
+                logits = net.only_liner(features)
+                loss_ce = self.loss_func(logits, labels)
+
+                contrast_loss = AnchorContrastiveLoss(
+                    anchors=self.anchor,
+                    temperature=0.5,
+                    device=self.args.device
+                )(features=logits, labels=labels)
+
+                with torch.no_grad():
+                    teacher_outputs = teacher_net(images)
+                    # --- 删除开始 ---
+                    # 不再使用 adjuster 对教师模型的输出进行调整
+                    # adjusted_teacher_outputs = self.teacher_output_adjuster(teacher_outputs)
+                    # --- 删除结束 ---
+
+                # --- 修改后 ---
+                # 直接将原始的 teacher_outputs 传入，确保其维度与 logits 一致 (都为 num_classes)
+                distillation_loss = AnchorDistillationLoss(logits, teacher_outputs, self.anchor, temperature=1.0)()
+                # --- 修改结束 ---
+
+                # 第一次前向传播，计算带权重的总损失，用于后续计算梯度
+                loss = loss_weights[0] * loss_ce + loss_weights[1] * contrast_loss + loss_weights[2] * distillation_loss
+                optimizer.zero_grad()
+                loss.backward(retain_graph=True)
+
+                # 计算每个损失项的梯度范数
+                grad_norms = []
+                for i, loss_i in enumerate([loss_ce, contrast_loss, distillation_loss]):
+                    optimizer.zero_grad()
+                    loss_i.backward(retain_graph=True)
+                    grad_i = [p.grad.clone().detach() for p in body_params if p.grad is not None]
+                    if not grad_i:
+                        grad_norm_i = torch.tensor(0.0, device=self.args.device)
+                    else:
+                        grad_norm_i = torch.stack([g.norm() for g in grad_i]).mean()
+                    grad_norms.append(grad_norm_i)
+
+                # GradNorm: 更新损失权重
+                grad_norms = torch.stack(grad_norms)
+                target_norm = grad_norms.mean()
+
+                epsilon = 1e-6
+                loss_ratios = (grad_norms + epsilon) / (target_norm + epsilon)
+
+                loss_weights_grad = loss_ratios - loss_ratios.mean()
+
+                optimizer_weights.zero_grad()
+                loss_weights.backward(gradient=loss_weights_grad)
+                optimizer_weights.step()
+
+                with torch.no_grad():
+                    loss_weights.data = 3 * torch.softmax(loss_weights.data, dim=0)
+
+                # 使用更新后的权重重新计算总损失并进行模型参数优化
+                loss = loss_weights[0] * loss_ce + loss_weights[1] * contrast_loss + loss_weights[2] * distillation_loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                batch_loss.append(loss.item())
+            epoch_loss.append(sum(batch_loss)/len(batch_loss))
+
+        # 应用元学习率更新参数
+        with torch.no_grad():
+            for name, param in net.named_parameters():
+                if 'linear' not in name:
+                    initial_p = initial_body_state[name]
+                    param.data = initial_p + (param.data - initial_p) * self.base_meta.item()
+
+        # 计算元损失并更新元学习率
+        meta_loss = 0.0
+        net.eval()
+        with torch.enable_grad():
+            for images, labels in self.ldr_train:
+                images, labels = images.to(self.args.device), labels.to(self.args.device)
+                features = net.extract_features(images)
+                meta_loss += AnchorContrastiveLoss(
+                    anchors=self.anchor,
+                    temperature=0.5,
+                    device=self.args.device
+                )(features=net.only_liner(features), labels=labels)
+        meta_loss /= len(self.ldr_train)
+
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+        self.meta_optimizer.step()
+        self.base_meta.data.clamp_(min=self.min_lr, max=self.max_lr)
+
+        # 聚合原型
+        agg_protos_label = {}
+        with torch.no_grad():
+            for batch_idx, (images, labels) in enumerate(self.ldr_train):
+                images, labels = images.to(self.args.device), labels.to(self.args.device)
+                features = net.extract_features(images)
+                uniq_l = labels.unique()
+                for label in uniq_l:
+                    lbl = label.item()
+                    mask = labels == lbl
+                    label_features = features[mask]
+                    if len(label_features) == 0: continue
+                    weights = torch.softmax(label_features.norm(dim=1), dim=0)
+                    weighted_features = (label_features.T @ weights).T
+                    if lbl in agg_protos_label:
+                        agg_protos_label[lbl] += weighted_features.cpu()
+                    else:
+                        agg_protos_label[lbl] = weighted_features.cpu()
+
+            for lbl in agg_protos_label:
+                agg_protos_label[lbl] /= len(self.ldr_train)
+
         return net.state_dict(), sum(epoch_loss)/len(epoch_loss), agg_protos_label
     
-class AnchorDistillationLoss(nn.Module):
+'''class AnchorDistillationLoss(nn.Module):
     def __init__(self, student_outputs, teacher_outputs, anchors, temperature=1.0, device='cuda'):
         super(AnchorDistillationLoss, self).__init__()
         self.anchors = nn.Parameter(anchors, requires_grad=False)  # 锚点不应梯度下降
@@ -313,8 +609,318 @@ class AnchorDistillationLoss(nn.Module):
         # 取所有样本损失的平均值作为批次的蒸馏损失
         loss = torch.mean(loss)
         
-        return loss
+        return loss'''
 
+class AnchorDistillationLoss(nn.Module):
+    def __init__(self, student_outputs, teacher_outputs, anchors, temperature=1.0, lambda_anchor=0.1, device='cuda'):
+        """
+        初始化锚点蒸馏损失。
+
+        Args:
+            student_outputs (torch.Tensor): 学生模型的原始输出 (logits)。
+            teacher_outputs (torch.Tensor): 教师模型的原始输出 (logits)。
+            anchors (torch.Tensor): 锚点张量。
+            temperature (float): 知识蒸馏中的温度参数 τ。
+            lambda_anchor (float): 锚点成本项的权重 λ。
+            device (str): 计算设备 ('cuda' 或 'cpu')。
+        """
+        super(AnchorDistillationLoss, self).__init__()
+        self.temperature = temperature
+        self.lambda_anchor = lambda_anchor
+        self.student_outputs = student_outputs
+        self.teacher_outputs = teacher_outputs
+        self.device = device
+        
+        # Sinkhorn-Knopp算法参数
+        self.sinkhorn_iterations = 10
+        self.sinkhorn_epsilon = 0.1
+        
+        # 确保 anchors 的维度是 [num_classes, feature_dim]
+        # 并将其设置为不需要梯度的参数
+        self.anchors = nn.Parameter(anchors, requires_grad=False)
+        
+        # 如果锚点的特征维度与类别数不匹配，则进行调整
+        num_classes = student_outputs.size(1)
+        if self.anchors.size(0) != num_classes:
+            # 注意：这里的逻辑假设锚点的第一维是类别数，如果不是，需要调整
+            # 原始代码中是 anchors.size(1)，这里根据上下文理解调整为 anchors.size(0)
+            # 如果 anchors 的形状是 [num_anchors, feature_dim]，需要一个映射层
+            # 这里我们假设 anchors 的形状是 [num_classes, feature_dim]
+            pass # 根据实际的锚点维度设计调整逻辑
+        
+        # 注意：原adjust_anchors逻辑可能不适用于所有情况，此处保留但需谨慎使用
+        # if anchors.size(1) != num_classes:
+        #     self.anchors = self.adjust_anchors(anchors, num_classes)
+
+
+    def adjust_anchors(self, anchors, num_classes):
+        """
+        通过一个线性层调整 anchors 的特征维度以匹配 num_classes。
+        """
+        # 这个函数在当前上下文中可能不是必需的，因为成本是基于锚点内部的距离计算的
+        linear_transform = nn.Linear(anchors.size(1), num_classes).to(self.device)
+        adjusted_anchors = linear_transform(anchors)
+        return nn.Parameter(adjusted_anchors, requires_grad=False)
+
+    def sinkhorn_knopp(self, cost_matrix):
+        """
+        Sinkhorn-Knopp算法实现，用于计算最优传输矩阵。
+        输入是成本矩阵 C，算法内部会计算 K = exp(-C/ε)。
+
+        Args:
+            cost_matrix (torch.Tensor): 成本矩阵 [batch_size, num_classes, num_classes]
+            
+        Returns:
+            transport_matrix (torch.Tensor): 最优传输矩阵 [batch_size, num_classes, num_classes]
+        """
+        batch_size, n, m = cost_matrix.shape
+        
+        # 初始化传输矩阵 K = exp(-C/ε)
+        K = torch.exp(-cost_matrix / self.sinkhorn_epsilon)
+        
+        # 初始化行和列的缩放因子
+        u = torch.ones(batch_size, n, 1, device=self.device) / n
+        v = torch.ones(batch_size, m, 1, device=self.device) / m
+        
+        # Sinkhorn迭代
+        for _ in range(self.sinkhorn_iterations):
+            u = 1.0 / (torch.bmm(K, v) + 1e-8)
+            v = 1.0 / (torch.bmm(K.transpose(1, 2), u) + 1e-8)
+        
+        # 计算最优传输矩阵 T = diag(u) * K * diag(v)
+        transport_matrix = u * K * v.transpose(1, 2)
+        
+        return transport_matrix
+
+    def compute_cost_matrix(self, student_probs, teacher_probs):
+        """
+        根据修改方案，清晰地计算总成本矩阵。
+        C_total(i, j) = ||PS_τ(i) - PT_τ(j)||_2^2 + λ * ||A'(i) - A'(j)||_2^2
+
+        Args:
+            student_probs (torch.Tensor): 学生模型概率分布 [batch_size, num_classes]
+            teacher_probs (torch.Tensor): 教师模型概率分布 [batch_size, num_classes]
+            
+        Returns:
+            total_cost_matrix (torch.Tensor): 总成本矩阵 [batch_size, num_classes, num_classes]
+        """
+        batch_size, num_classes = student_probs.shape
+        
+        # 第一部分：计算概率分布之间的成本
+        # ||PS_τ(i) - PT_τ(j)||_2^2
+        # student_probs[b, i] 和 teacher_probs[b, j] 之间的差的平方
+        student_expanded = student_probs.unsqueeze(2)  # [batch_size, num_classes, 1]
+        teacher_expanded = teacher_probs.unsqueeze(1)  # [batch_size, 1, num_classes]
+        prob_cost = torch.pow(student_expanded - teacher_expanded, 2)
+        
+        # 第二部分：计算锚点之间的成本
+        # λ * ||A'(i) - A'(j)||_2^2
+        # A' 是 self.anchors
+        if self.lambda_anchor > 0 and self.anchors is not None:
+            # 计算锚点间的L2距离
+            anchor_dist = torch.cdist(self.anchors, self.anchors, p=2)
+            # 计算L2距离的平方
+            anchor_cost_squared = torch.pow(anchor_dist, 2)
+            # 乘以权重λ，并扩展到与prob_cost相同的批次大小
+            anchor_cost_term = self.lambda_anchor * anchor_cost_squared.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            anchor_cost_term = 0.0
+
+        # 总成本矩阵
+        total_cost_matrix = prob_cost + anchor_cost_term
+        
+        return total_cost_matrix
+
+    def earth_movers_distance(self, cost_matrix, transport_matrix):
+        """
+        计算Earth Mover's Distance (Wasserstein Distance)。
+        此函数被重构以直接接收成本矩阵，避免重复计算。
+
+        Args:
+            cost_matrix (torch.Tensor): 成本矩阵 [batch_size, num_classes, num_classes]
+            transport_matrix (torch.Tensor): 最优传输矩阵 [batch_size, num_classes, num_classes]
+            
+        Returns:
+            emd_loss (torch.Tensor): EMD损失的均值
+        """
+        # EMD = sum(T_ij * C_ij)，其中T是传输矩阵，C是成本矩阵
+        emd = torch.sum(transport_matrix * cost_matrix, dim=[1, 2])
+        
+        return torch.mean(emd)
+
+    def forward(self):
+        """
+        计算基于Sinkhorn-Knopp软对齐的蒸馏损失。
+        流程已根据修改意见简化和明确。
+        
+        Returns:
+            loss (torch.Tensor): 计算得到的最终蒸馏损失
+        """
+        # 1. 根据公式清晰定义学生和教师模型的概率分布 PS_τ 和 PT_τ
+        # PS_τ(i, j) = exp(S_ij/τ) / Σ_k exp(S_ik/τ)
+        student_probs = F.softmax(self.student_outputs / self.temperature, dim=1)
+        teacher_probs = F.softmax(self.teacher_outputs / self.temperature, dim=1)
+        
+        # 2. 将锚点信息明确加入到蒸馏的成本矩阵中
+        # C_total = ||PS_τ(i) - PT_τ(j)||_2^2 + λ * ||A'(i) - A'(j)||_2^2
+        cost_matrix = self.compute_cost_matrix(student_probs, teacher_probs)
+        
+        # 3. 明确输入到 Sinkhorn-Knopp 算法的矩阵为 exp(-C_total)
+        #    我们的 sinkhorn_knopp 函数接收 C_total，并在内部计算 K = exp(-C_total / ε)
+        # T = Sinkhorn-Knopp(C_total)
+        transport_matrix = self.sinkhorn_knopp(cost_matrix)
+        
+        # 4. 计算Earth Mover's Distance作为最终的蒸馏损失
+        emd_loss = self.earth_movers_distance(cost_matrix, transport_matrix)
+        
+        return emd_loss
+
+'''class AnchorDistillationLoss(nn.Module):
+    def __init__(self, student_outputs, teacher_outputs, anchors, temperature=1.0, device='cuda'):
+        super(AnchorDistillationLoss, self).__init__()
+        self.anchors = nn.Parameter(anchors, requires_grad=False)
+        self.temperature = temperature
+        self.student_outputs = student_outputs
+        self.teacher_outputs = teacher_outputs
+        self.device = device
+        
+        # Sinkhorn-Knopp算法参数
+        self.sinkhorn_iterations = 10
+        self.sinkhorn_epsilon = 0.1
+        
+        # 确保 anchors 的维度是 [num_classes, num_classes]
+        num_classes = student_outputs.size(1)
+        if anchors.size(1) != num_classes:
+            self.anchors = self.adjust_anchors(anchors, num_classes)
+
+    def adjust_anchors(self, anchors, num_classes):
+        """
+        调整 anchors 的维度以匹配 num_classes。
+        """
+        linear_transform = nn.Linear(anchors.size(1), num_classes).to(self.device)
+        adjusted_anchors = linear_transform(anchors)
+        return nn.Parameter(adjusted_anchors, requires_grad=False)
+
+    def sinkhorn_knopp(self, cost_matrix, num_iterations=None, epsilon=None):
+        """
+        Sinkhorn-Knopp算法实现，用于计算最优传输矩阵
+        
+        Args:
+            cost_matrix: 成本矩阵 [batch_size, num_classes, num_classes]
+            num_iterations: Sinkhorn迭代次数
+            epsilon: 正则化参数
+            
+        Returns:
+            transport_matrix: 最优传输矩阵
+        """
+        if num_iterations is None:
+            num_iterations = self.sinkhorn_iterations
+        if epsilon is None:
+            epsilon = self.sinkhorn_epsilon
+            
+        batch_size, n, m = cost_matrix.shape
+        
+        # 初始化传输矩阵 K = exp(-C/ε)
+        K = torch.exp(-cost_matrix / epsilon)
+        
+        # 初始化行和列的缩放因子
+        u = torch.ones(batch_size, n, 1, device=self.device) / n
+        v = torch.ones(batch_size, m, 1, device=self.device) / m
+        
+        # Sinkhorn迭代
+        for _ in range(num_iterations):
+            # 更新行缩放因子
+            u = 1.0 / (torch.bmm(K, v) + 1e-8)
+            # 更新列缩放因子
+            v = 1.0 / (torch.bmm(K.transpose(1, 2), u) + 1e-8)
+        
+        # 计算最优传输矩阵
+        transport_matrix = u * K * v.transpose(1, 2)
+        
+        return transport_matrix
+
+    def compute_cost_matrix(self, student_probs, teacher_probs):
+        """
+        计算学生和教师概率分布之间的成本矩阵
+        
+        Args:
+            student_probs: 学生模型概率分布 [batch_size, num_classes]
+            teacher_probs: 教师模型概率分布 [batch_size, num_classes]
+            
+        Returns:
+            cost_matrix: 成本矩阵 [batch_size, num_classes, num_classes]
+        """
+        batch_size, num_classes = student_probs.shape
+        
+        # 扩展维度用于计算成本矩阵
+        student_expanded = student_probs.unsqueeze(2)  # [batch_size, num_classes, 1]
+        teacher_expanded = teacher_probs.unsqueeze(1)  # [batch_size, 1, num_classes]
+        
+        # 计算L2距离作为成本
+        cost_matrix = torch.pow(student_expanded - teacher_expanded, 2)
+        
+        # 可选：加入锚点信息到成本计算中
+        if hasattr(self, 'anchors') and self.anchors is not None:
+            # 使用锚点调节成本矩阵
+            anchor_cost = torch.cdist(self.anchors, self.anchors, p=2)
+            anchor_cost = anchor_cost.unsqueeze(0).expand(batch_size, -1, -1)
+            cost_matrix = cost_matrix + 0.1 * anchor_cost  # 可调节权重
+        
+        return cost_matrix
+
+    def earth_movers_distance(self, student_probs, teacher_probs, transport_matrix):
+        """
+        计算Earth Mover's Distance (Wasserstein Distance)
+        
+        Args:
+            student_probs: 学生模型概率分布
+            teacher_probs: 教师模型概率分布  
+            transport_matrix: 最优传输矩阵
+            
+        Returns:
+            emd_loss: EMD损失
+        """
+        # 计算成本矩阵
+        cost_matrix = self.compute_cost_matrix(student_probs, teacher_probs)
+        
+        # EMD = sum(T_ij * C_ij)，其中T是传输矩阵，C是成本矩阵
+        emd_loss = torch.sum(transport_matrix * cost_matrix, dim=[1, 2])
+        
+        return torch.mean(emd_loss)
+
+    def forward(self):
+        """
+        计算基于Sinkhorn-Knopp软对齐的蒸馏损失。
+        
+        Returns:
+            loss: 计算得到的蒸馏损失
+        """
+        # 计算学生和教师模型的softmax概率
+        student_probs = F.softmax(self.student_outputs / self.temperature, dim=1)
+        teacher_probs = F.softmax(self.teacher_outputs / self.temperature, dim=1)
+        
+        # 将锚点信息融入学生特征
+        anchors_expanded = self.anchors.unsqueeze(0)
+        student_features = torch.matmul(student_probs, anchors_expanded.squeeze(0))
+        
+        # 确保特征维度匹配
+        if student_features.size(1) != teacher_probs.size(1):
+            linear_transform = nn.Linear(student_features.size(1), teacher_probs.size(1)).to(self.device)
+            student_features = linear_transform(student_features)
+        
+        # 重新计算调整后的学生概率
+        student_probs_adjusted = F.softmax(student_features / self.temperature, dim=1)
+        
+        # 计算成本矩阵
+        cost_matrix = self.compute_cost_matrix(student_probs_adjusted, teacher_probs)
+        
+        # 使用Sinkhorn-Knopp算法计算最优传输矩阵
+        transport_matrix = self.sinkhorn_knopp(cost_matrix)
+        
+        # 计算Earth Mover's Distance作为蒸馏损失
+        emd_loss = self.earth_movers_distance(student_probs_adjusted, teacher_probs, transport_matrix)
+        
+        return emd_loss'''
     
 #fedavg
 class LocalUpdate(object):
@@ -817,7 +1423,7 @@ class LocalUpdateTARGET(object):
 
 #ReFed
 class LocalUpdateReFed(object):
-    def __init__(self, args, dataset=None, idxs=None, task=0, pretrain=False, mod = None):
+    def __init__(self, args, dataset=None, idxs=None, task=0, pretrain=False):
         self.args = args
         self.loss_func = nn.CrossEntropyLoss()
         self.selected_clients = []
@@ -825,8 +1431,7 @@ class LocalUpdateReFed(object):
         self.pretrain = pretrain
 
         # 初始化个性化信息模型 (PIM)
-        #self.pim = copy.deepcopy(args.global_model)  # 全局模型初始化 PIM
-        self.pim = copy.deepcopy(mod)
+        self.pim = copy.deepcopy(args.global_model)  # 全局模型初始化 PIM
         self.cached_samples = []  # 缓存的重要样本
 
     def train(self, net, lr, idx=-1, local_eps=None):
@@ -873,7 +1478,7 @@ class LocalUpdateReFed(object):
     def update_pim_and_cache_samples(self, net):
         # 更新个性化信息模型 (PIM)
         self.pim.train()
-        pim_optimizer = torch.optim.SGD(self.pim.parameters(), lr=0.1,
+        pim_optimizer = torch.optim.SGD(self.pim.parameters(), lr=self.args.lr_pim,
                                          momentum=self.args.momentum,
                                          weight_decay=self.args.wd)
 
@@ -883,30 +1488,25 @@ class LocalUpdateReFed(object):
         for batch_idx, (images, labels) in enumerate(self.ldr_train):
             images, labels = images.to(self.args.device), labels.to(self.args.device)
 
-            for i in range(len(images)):
-                image = images[i].unsqueeze(0)
-                label = labels[i].unsqueeze(0)
+            # 前向传播
+            logits = self.pim(images)
+            loss = self.loss_func(logits, labels)
 
-                # 前向传播
-                logits = self.pim(image)
-                loss = self.loss_func(logits, label)
-
-                # 反向传播更新 PIM
-                pim_optimizer.zero_grad()
-                loss.backward()
-
-                # 计算样本梯度范数作为重要性分数
-                sample_grad_norm = torch.norm(self.pim.linear.weight.grad).item()
-                if (image, label) not in importance_scores:
-                    importance_scores[(image, label)] = 0
-                importance_scores[(image, label)] += sample_grad_norm
-
-            # 批量更新 PIM
+            # 反向传播更新 PIM
+            pim_optimizer.zero_grad()
+            loss.backward()
             pim_optimizer.step()
+
+            # 计算样本梯度范数作为重要性分数
+            for i in range(len(images)):
+                sample_grad_norm = torch.norm(self.pim.fc.weight.grad[i]).item()
+                if (images[i], labels[i]) not in importance_scores:
+                    importance_scores[(images[i], labels[i])] = 0
+                importance_scores[(images[i], labels[i])] += sample_grad_norm
 
         # 根据重要性分数缓存样本
         sorted_samples = sorted(importance_scores.items(), key=lambda x: x[1], reverse=True)
-        max_cache_size = 5
+        max_cache_size = self.args.max_cache_size
         self.cached_samples = [sample for sample, _ in sorted_samples[:max_cache_size]]
 
         # 将缓存的样本与新任务数据合并，用于下一次训练
