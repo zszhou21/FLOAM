@@ -16,7 +16,7 @@ np.random.seed(2266)
 # 数据集存储地址
 datasetroot_dir = "/root/tiny-imagenet-200"
 # 生成数据集存储地址
-basedir = "./tinyimagenet-incremental-{}-task-{}".format(alpha, num_task)
+basedir = "./tinyimagenet-dir-{}-task-{}".format(alpha, num_task)
 if not os.path.exists(basedir):
     os.mkdir(basedir)
 
