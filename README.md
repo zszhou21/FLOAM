@@ -5,5 +5,5 @@ Federated continual learning (FCL) aims to enable decentralized agents to increm
 Before running the main code, the data allocation program need to be executed.Data allocation methods are categorized into multi-task and class-incremental types, all data allocation code is located in the `./dataset` folder.
 
 ### Run FLOAM
-The code can be run as follows:
+The code can be run as follows:<br>
 `python main_floam.py --dataset cifar10 --model resnet18 --num_classes 10 --epochs 100 --lr 0.1 --num_users 20 --frac 0.5 --local_ep 5 --local_bs 50 --results_save run0 --wd 0.0 --datasetpath ./dataset/cifar10-dir-0.1-task-10 --task_num 10`
