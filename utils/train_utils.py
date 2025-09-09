@@ -3,6 +3,7 @@ from models.Nets import CNNCifar, MobileNetCifar, CNNMnist
 from models.ResNet import ResNet18, ResNet50
 from models.tinyresnet import TinyResNet18
 from utils.sampling import iid, noniid, iid_unbalanced, noniid_unbalanced
+from models.speechresnet import SpeechResNet18
 
 trans_mnist = transforms.Compose([transforms.ToTensor(),
                                   transforms.Normalize((0.1307,), (0.3081,))])
@@ -105,6 +106,8 @@ def get_model(args):
     elif args.model == 'cnn' and args.dataset in ['mnist','fmnist']:
         net_glob = CNNMnist(args=args).to(args.device)
         print('cnnmnist')
+    elif args.model == 'speechresnet' and args.dataset == 'speechcommands':
+        net_glob = SpeechResNet18(num_classes=args.num_classes).to(args.device)
     elif args.model == 'mlp' and args.dataset == 'mnist':
         net_glob = MLP(dim_in=784, dim_hidden=256, dim_out=args.num_classes).to(args.device)
     else:
