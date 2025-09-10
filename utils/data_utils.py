@@ -45,7 +45,11 @@ def read_client_data(dataset, idx, task, is_train=True):
 
     if is_train:
         train_data = read_data(dataset, idx, task_num=task, is_train=True)
-        X_train = torch.Tensor(train_data['x']).type(torch.float32)
+        # For text data (like yahooanswers), X should be integer token IDs, not float
+        if dataset in ['yahooanswers', 'agnews', 'yelp', 'massiveproduct', 'dbpedia', 'newscategory']:
+            X_train = torch.Tensor(train_data['x']).type(torch.long)
+        else:
+            X_train = torch.Tensor(train_data['x']).type(torch.float32)
         y_train = torch.Tensor(train_data['y']).type(torch.int64)
         
         # Add channel dimension for speech spectrograms (batch_size, height, width) -> (batch_size, 1, height, width)
@@ -56,7 +60,11 @@ def read_client_data(dataset, idx, task, is_train=True):
         return train_data
     else:
         test_data = read_data(dataset, idx, task_num=task, is_train=False)
-        X_test = torch.Tensor(test_data['x']).type(torch.float32)
+        # For text data (like yahooanswers), X should be integer token IDs, not float
+        if dataset in ['yahooanswers', 'agnews', 'yelp', 'massiveproduct', 'dbpedia', 'newscategory']:
+            X_test = torch.Tensor(test_data['x']).type(torch.long)
+        else:
+            X_test = torch.Tensor(test_data['x']).type(torch.float32)
         y_test = torch.Tensor(test_data['y']).type(torch.int64)
         
         # Add channel dimension for speech spectrograms
@@ -65,7 +73,6 @@ def read_client_data(dataset, idx, task, is_train=True):
         
         test_data = [(x, y) for x, y in zip(X_test, y_test)]
         return test_data
-
 
 def load_train_data(dataset, id, task, batch_size=None):
         if batch_size == None:
