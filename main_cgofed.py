@@ -18,12 +18,22 @@ import pdb
 from collections import defaultdict
 from sklearn.decomposition import PCA
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # 新增
 
 def compute_similarity_matrix(client_matrices, server_matrices, target_dim=128):
     """
     Compute similarity matrix between client and server representation matrices.
     Ensure both matrices have the same shape after dimensionality reduction.
     """
+    # GPU PCA helper
+    def pca_gpu(matrix, n_components):
+        X = torch.from_numpy(matrix).float().to(device)
+        X = X - X.mean(0)
+        # torch.linalg.svd 支持在 GPU 上跑
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        # 主成分投影
+        return (X @ Vh[:n_components].T).cpu().numpy()
+
     similarity_matrix = {}
 
     for client_idx, client_matrix in client_matrices.items():
@@ -33,9 +43,8 @@ def compute_similarity_matrix(client_matrices, server_matrices, target_dim=128):
         max_components_client = min(client_matrix.shape[0], client_matrix.shape[1])
         pca_dim_client = min(target_dim, max_components_client)
 
-        # Reduce client matrix dimension
-        pca_client = PCA(n_components=pca_dim_client)
-        client_matrix_reduced = pca_client.fit_transform(client_matrix)
+        # GPU PCA
+        client_matrix_reduced = pca_gpu(client_matrix, pca_dim_client)
 
         for task_idx, server_matrix in server_matrices.items():
             # Dynamically determine the number of components for server matrix
@@ -45,12 +54,9 @@ def compute_similarity_matrix(client_matrices, server_matrices, target_dim=128):
             # Ensure both matrices have the same feature dimension
             pca_dim = min(pca_dim_client, pca_dim_server)
 
-            # Reinitialize PCA for both client and server matrices
-            pca_client_final = PCA(n_components=pca_dim)
-            pca_server_final = PCA(n_components=pca_dim)
-
-            client_matrix_final = pca_client_final.fit_transform(client_matrix)
-            server_matrix_final = pca_server_final.fit_transform(server_matrix)
+            # GPU PCA
+            client_matrix_final = pca_gpu(client_matrix, pca_dim)
+            server_matrix_final = pca_gpu(server_matrix, pca_dim)
 
             # Align shapes by padding or truncating rows
             max_rows = max(client_matrix_final.shape[0], server_matrix_final.shape[0])
