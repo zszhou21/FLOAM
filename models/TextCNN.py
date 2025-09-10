@@ -40,6 +40,11 @@ class TextCNN(nn.Module):
         else:
             text = x
 
+        # Ensure text is of correct type for embedding layer
+        # Convert float tensors to long tensors if necessary
+        if text.dtype == torch.float32 or text.dtype == torch.float64:
+            text = text.long()
+        
         embedded_sent = self.embedding(text).permute(0,2,1)
         
         conv_out1 = self.conv1(embedded_sent).squeeze(2)
@@ -50,4 +55,30 @@ class TextCNN(nn.Module):
         final_feature_map = self.dropout(all_out)
         out = self.fc(final_feature_map)
 
+        return out
+    
+    def extract_features(self, x):
+        if type(x) == type([]):
+            text, _ = x
+        else:
+            text = x
+
+        # Ensure text is of correct type for embedding layer
+        # Convert float tensors to long tensors if necessary
+        if text.dtype == torch.float32 or text.dtype == torch.float64:
+            text = text.long()
+
+        embedded_sent = self.embedding(text).permute(0,2,1)
+        
+        conv_out1 = self.conv1(embedded_sent).squeeze(2)
+        conv_out2 = self.conv2(embedded_sent).squeeze(2)
+        conv_out3 = self.conv3(embedded_sent).squeeze(2)
+        
+        all_out = torch.cat((conv_out1, conv_out2, conv_out3), 1)
+        final_feature_map = self.dropout(all_out)
+        
+        return final_feature_map
+    
+    def only_liner(self, features):
+        out = self.fc(features)
         return out

@@ -56,6 +56,8 @@ class FedACDServer:
             return create_anchor(200, 2048)
         elif self.args.dataset == 'speechcommands':
             return create_anchor(30, 512)
+        elif self.args.dataset == 'yahooanswers':
+            return create_anchor(10, 300)
         return create_anchor(10, 32)  # 默认值
 
     def _create_save_directory(self):
